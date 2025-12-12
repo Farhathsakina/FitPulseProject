@@ -1,0 +1,60 @@
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+  Network URL: http://192.168.29.72:8501
+
+  For better performance, install the Watchdog module:
+
+  $ xcode-select --install
+  $ pip install watchdog
+            
+08:51:29 - cmdstanpy - INFO - Chain [1] start processing
+08:51:29 - cmdstanpy - INFO - Chain [1] done processing
+2025-12-12 08:51:29.793 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+2025-12-12 08:51:29.796 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hemubolt/FitPulseProject/venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 129, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hemubolt/FitPulseProject/venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 671, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hemubolt/FitPulseProject/app_fitpulse.py", line 557, in <module>
+    km_labels, db_labels, kmr, dbr = _run_both_clusters(feat, m_k, m_db_eps, m_db_min)
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hemubolt/FitPulseProject/app_fitpulse.py", line 493, in _run_both_clusters
+    km = KMeans(n_clusters=int(k), random_state=42, n_init=10).fit(X)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hemubolt/FitPulseProject/venv/lib/python3.12/site-packages/sklearn/base.py", line 1365, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hemubolt/FitPulseProject/venv/lib/python3.12/site-packages/sklearn/cluster/_kmeans.py", line 1464, in fit
+    self._check_params_vs_input(X)
+  File "/Users/hemubolt/FitPulseProject/venv/lib/python3.12/site-packages/sklearn/cluster/_kmeans.py", line 1404, in _check_params_vs_input
+    super()._check_params_vs_input(X, default_n_init=10)
+  File "/Users/hemubolt/FitPulseProject/venv/lib/python3.12/site-packages/sklearn/cluster/_kmeans.py", line 871, in _check_params_vs_input
+    raise ValueError(
+ValueError: n_samples=2 should be >= n_clusters=3.
+08:51:36 - cmdstanpy - INFO - Chain [1] start processing
+08:51:36 - cmdstanpy - INFO - Chain [1] done processing
+2025-12-12 08:51:36.784 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+2025-12-12 08:51:36.889 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+2025-12-12 08:51:36.903 Please replace `use_container_width` with `width`.
+
+`use_container_width` will be removed after 2025-12-31.
+
+For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
+  Stopping...

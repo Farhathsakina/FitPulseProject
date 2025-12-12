@@ -1,0 +1,158 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="FitPulse Health — Anomaly Detection", layout="wide")
+
+# =====================================================================
+# TITLE
+# =====================================================================
+st.markdown("<h1 style='text-align:center;'>❤️ FitPulse Health — Anomaly Detection from Fitness Devices</h1>", unsafe_allow_html=True)
+st.markdown("### A Professional Data Cleaning + Preprocessing + Visualization Dashboard")
+
+# =====================================================================
+# MAIN LAYOUT (LEFT CONTROLS + RIGHT OUTPUT)
+# =====================================================================
+left, right = st.columns([1.2, 3])
+
+# ---------------------------------------------------------------------
+# LEFT PANEL — ALL CONTROLS (NO SIDEBAR)
+# ---------------------------------------------------------------------
+with left:
+    st.markdown("### ⚙️ Pipeline Controls")
+
+    n_rows = st.number_input("Number of sample rows to generate (demo)", 10, 200, 50, 10)
+
+    inject_missing = st.checkbox("Inject random missing values (demo)", False)
+    missing_frac = st.slider("Missing fraction", 0.0, 0.40, 0.10)
+
+    outlier_method = st.selectbox("Outlier handling method", ["clip_iqr", "zscore"])
+    resample_freq = st.selectbox("Resample frequency", ["1min", "5min"])
+
+    run_btn = st.button("🚀 Run Preprocessing")
+
+# ---------------------------------------------------------------------
+# FUNCTION: Generate demo dataset
+# ---------------------------------------------------------------------
+def generate_sample(n=50):
+    timestamps = pd.date_range("2025-01-01", periods=n, freq="1min")
+    hr = np.random.normal(75, 8, n)                       # heart rate baseline
+    steps = np.random.randint(0, 25, n)                   # random steps
+    calories = np.random.uniform(1.0, 3.0, n)
+    sleep_flag = np.random.randint(0, 2, n)
+    activity_type = np.random.randint(0, 4, n)
+
+    df = pd.DataFrame({
+        "timestamp": timestamps,
+        "heart_rate": hr,
+        "steps": steps,
+        "calories": calories,
+        "sleep_flag": sleep_flag,
+        "activity_type": activity_type
+    })
+
+    return df
+
+# =====================================================================
+# RUN PIPELINE
+# =====================================================================
+with right:
+    if run_btn:
+        st.markdown("## 🧹 Preprocessing Pipeline — Running...")
+
+        # 1) Generate sample data
+        st.info("📌 Generating sample dataset...")
+        df = generate_sample(n_rows)
+        st.dataframe(df.head())
+
+        # 2) Inject missing values
+        if inject_missing:
+            st.warning("⚠️ Injecting random missing values for demo...")
+            for col in ["heart_rate", "steps", "calories"]:
+                df.loc[df.sample(frac=missing_frac).index, col] = np.nan
+
+        # 3) Normalize timestamps
+        st.info("⏳ Normalizing timestamps…")
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # 4) Remove duplicates
+        st.info("🧽 Removing duplicates…")
+        df = df.drop_duplicates(subset=["timestamp"])
+
+        # --- OUTLIER SUMMARY (insert right after outlier correction) ---
+# compute and display outlier diagnostics for heart_rate
+if "heart_rate" in df.columns:
+    hr_series = df["heart_rate"].astype(float)
+    # z-score
+    mean = hr_series.mean(); std = hr_series.std(ddof=0)
+    z_scores = (hr_series - mean) / (std if std!=0 else 1)
+    z_out_count = int((z_scores.abs() > 3).sum())
+    # IQR
+    q1 = hr_series.quantile(0.25); q3 = hr_series.quantile(0.75); iqr = q3 - q1
+    iqr_mask = (hr_series < (q1 - 1.5*iqr)) | (hr_series > (q3 + 1.5*iqr))
+    iqr_out_count = int(iqr_mask.sum())
+
+    st.markdown("### Outlier detection summary")
+    st.write({
+        "heart_rate_mean": float(mean),
+        "heart_rate_std": float(std),
+        "z_outliers_count": z_out_count,
+        "iqr_outliers_count": iqr_out_count
+    })
+
+    # show example outlier rows (from pre-cleaned df)
+    example_mask = (z_scores.abs() > 3) | iqr_mask
+    if example_mask.any():
+        st.warning("Example outlier rows (pre-fix)")
+        st.dataframe(df[example_mask].head(10))
+    else:
+        st.success("No outliers detected (by z>3 or IQR).")
+else:
+    st.info("No heart_rate column found for outlier diagnostics.")
+        # 6) Fill missing values
+        st.info("🩺 Filling missing values…")
+        df = df.fillna(method="ffill").fillna(method="bfill")
+
+        # 7) Resampling
+        st.info("🕒 Resampling to " + resample_freq)
+        df = df.set_index("timestamp").resample(resample_freq).mean().interpolate()
+
+        # 8) Final dataset
+        CLEAN_PATH = "/Users/hemubolt/FitPulseProject/data_processed/cleaned_fitness_data.csv"
+        df.to_csv(CLEAN_PATH)
+
+        st.success(f"✅ Preprocessing complete! Clean file saved to:\n{CLEAN_PATH}")
+        st.dataframe(df.head())
+
+        # =====================================================================
+        # VISUALIZATIONS
+        # =====================================================================
+
+        st.markdown("## 📊 Visualizations")
+
+        # HEART RATE CHART (with spike effect)
+        st.markdown("### ❤️ Heart Rate (Spike Visualization)")
+        fig, ax = plt.subplots(figsize=(12,4))
+        ax.plot(df.index, df["heart_rate"], color="red")
+        ax.set_ylabel("BPM")
+        ax.set_xlabel("Timestamp")
+        st.pyplot(fig)
+
+        # STEPS CHART
+        st.markdown("### 🦶 Steps Over Time")
+        fig2, ax2 = plt.subplots(figsize=(12,4))
+        ax2.bar(df.index, df["steps"], width=0.003, color="blue")
+        ax2.set_ylabel("Steps")
+        st.pyplot(fig2)
+
+        # SLEEP FLAG CHART
+        st.markdown("### 😴 Sleep Pattern")
+        fig3, ax3 = plt.subplots(figsize=(12,3))
+        ax3.plot(df.index, df["sleep_flag"], drawstyle="steps", color="purple")
+        ax3.set_ylabel("Sleep (1=Asleep)")
+        st.pyplot(fig3)
+
+    else:
+        st.info("👈 Configure options on the left and click **Run Preprocessing**.")
