@@ -6,6 +6,14 @@ from pathlib import Path
 import time
 import plotly.express as px
 import plotly.graph_objects as go
+import json
+from datetime import datetime
+from typing import Optional
+
+# sklearn
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import DBSCAN, KMeans
 
 st.set_page_config(page_title="FitPulse Health — Anomaly Detection", layout="wide")
 
@@ -17,7 +25,6 @@ RAW.mkdir(parents=True, exist_ok=True)
 PROC.mkdir(parents=True, exist_ok=True)
 OUT_CLEAN = PROC / "cleaned_fitness_data.csv"
 
-st.set_page_config(page_title="FitPulse Health — Anomaly Detection", layout="wide")
 st.markdown("<h1 style='text-align:center;'>❤️ FitPulse Health — Anomaly Detection from Fitness Devices</h1>", unsafe_allow_html=True)
 st.markdown("**Pipeline:** data creation → timestamp normalization → missing handling → outlier fix → resample → QC → clean CSV")
 
@@ -38,7 +45,7 @@ with left:
 def generate_sample(n=10, start_ts="2025-01-01 00:00:00"):
     ts = pd.date_range(start=start_ts, periods=n, freq="1T")
     rng = np.random.default_rng(42)
-    hr = (72 + 8*np.sin(np.linspace(0,3.5,n)) + rng.normal(0,2,n)).round(22)
+    hr = (72 + 8*np.sin(np.linspace(0,3.5,n)) + rng.normal(0,2,n)).round(4)
     steps = (rng.poisson(2, n) * (rng.random(n) < 0.3)).astype(int)
     calories = (0.9 + 0.5 * rng.random(n) + steps*0.05).round(2)
     sleep_flag = [1 if (i%30)<10 else 0 for i in range(n)]
@@ -54,15 +61,15 @@ def generate_sample(n=10, start_ts="2025-01-01 00:00:00"):
     return df
 
 def synth_ecg_from_bpm(bpm_df, max_seconds=60):
-    """Return a small high-res ecg-like DataFrame synthesized from minute BPM."""
     bpm_df = bpm_df.dropna().reset_index(drop=True)
     if bpm_df.empty:
         return pd.DataFrame({"timestamp":[], "ecg":[]})
     start = pd.to_datetime(bpm_df['timestamp'].iloc[0])
     end = pd.to_datetime(bpm_df['timestamp'].iloc[-1])
-    total_seconds = int(min((end - start).total_seconds(), max_seconds))
-    # build per-second series and 250ms highres
     per_sec = bpm_df.set_index('timestamp')['heart_rate'].resample('1S').mean().reindex(pd.date_range(start, end, freq='1S')).ffill().bfill()
+    if len(per_sec) == 0:
+        return pd.DataFrame({"timestamp":[], "ecg":[]})
+    total_seconds = int(min((end - start).total_seconds(), max_seconds))
     high_idx = pd.date_range(per_sec.index[0], periods=total_seconds*4+1, freq='250ms')
     bpm_high = per_sec.reindex(high_idx, method='ffill').fillna(method='ffill')
     sig = np.zeros(len(high_idx))
@@ -82,73 +89,137 @@ def synth_ecg_from_bpm(bpm_df, max_seconds=60):
     ecg = sig * (0.5 + 0.8 * amp)
     return pd.DataFrame({"timestamp": high_idx, "ecg": ecg})
 
-with main:
+# -----------------------------
+# Simple rolling-window fallback feature extractor
+# -----------------------------
+def simple_window_features(df: pd.DataFrame, metric_col: str, window_size: int, step: Optional[int] = None) -> pd.DataFrame:
+    """
+    Produces per-window aggregate features: mean, std, min, max, median, q25, q75, skew.
+    Each row corresponds to one window.
+    """
+    df = df.copy()
+    if metric_col not in df.columns:
+        return pd.DataFrame()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    if step is None:
+        step = max(1, window_size // 2)
+    rows = []
+    for i in range(0, len(df) - window_size + 1, step):
+        w = df.iloc[i : i + window_size][metric_col].astype(float).dropna()
+        if w.empty:
+            continue
+        agg = {
+            "mean": float(w.mean()),
+            "std": float(w.std(ddof=0)) if len(w) > 1 else 0.0,
+            "min": float(w.min()),
+            "max": float(w.max()),
+            "median": float(w.median()),
+            "q25": float(w.quantile(0.25)),
+            "q75": float(w.quantile(0.75)),
+            "skew": float(w.skew()) if len(w)>2 else 0.0,
+            "window_start": df['timestamp'].iloc[i],
+            "window_end": df['timestamp'].iloc[i+window_size-1]
+        }
+        rows.append(agg)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
-    # -------------------- 1️⃣ Data Creation --------------------
-    st.header("1️⃣ Data Creation — Raw Dataset")
-    st.markdown(
-        """
-This section displays the **raw dataset** which i will imported from Kaggle.
-It is shown here before applying any preprocessing or cleaning steps.
-Use the controls on the left (sample rows, missing values, outlier method, etc.) to configure the preprocessing, missing values, outlier method, etc)
-"""
-    )
+# ----------------------------
+# Milestone 2 helper: summary UI (must be defined before use)
+# ----------------------------
+def milestone2_summary_ui(report: dict,
+                          features_df: pd.DataFrame,
+                          prophet_count: int,
+                          clustering_methods: list,
+                          anomalies_count: int,
+                          proc_dir: Path = PROC):
+    """Displays summary and writes simple txt + json metadata to PROC."""
+    st.markdown("## 🎉 Milestone 2 Summary Report")
 
-    # Show RAW DATA (safe preview) — MUST be OUTSIDE the run_btn block
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Rows Processed", report.get("original_rows", 0))
+    with col2:
+        st.metric("Features Extracted", report.get("features_extracted", 0))
+    with col3:
+        st.metric("Prophet Models", prophet_count)
+    with col4:
+        st.metric("Clustering Methods", len(clustering_methods))
+
+    st.metric("Anomalies Detected", anomalies_count)
+
+    if report.get("error"):
+        st.error("Feature extraction error: " + str(report.get("error")))
+    else:
+        st.success("Milestone 2 Pipeline Completed Successfully ✔️")
+
+    st.markdown("### 📄 Summary (text)")
+    st.code(report.get("summary", ""), language="text")
+
+    # Save simple txt & meta
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    plain_lines = [
+        "FITPULSE — MILESTONE 2 SUMMARY",
+        f"Generated: {now}",
+        "",
+        f"Rows processed: {report.get('original_rows', 0)}",
+        f"Window size: {report.get('window_size', 0)}",
+        f"Windows created: {report.get('feature_windows', 0)}",
+        f"Features extracted: {report.get('features_extracted', 0)}",
+        f"Prophet models trained: {prophet_count}",
+        f"Clustering methods: {', '.join(clustering_methods) if clustering_methods else 'None'}",
+        f"Anomalies detected: {anomalies_count}",
+        f"Extraction error: {report.get('error', 'None')}",
+    ]
+    plain_text = "\n".join(plain_lines)
+    txt_path = proc_dir / "milestone2_summary.txt"
+    with open(txt_path, "w") as f:
+        f.write(plain_text)
+
+    meta = {
+        "generated": now,
+        "rows_processed": report.get('original_rows', 0),
+        "window_size": report.get('window_size', 0),
+        "windows_created": report.get('feature_windows', 0),
+        "features_extracted": report.get('features_extracted', 0),
+        "prophet_models_trained": prophet_count,
+        "clustering_methods": clustering_methods,
+        "anomalies_detected": anomalies_count,
+        "error": report.get('error', None)
+    }
+    with open(proc_dir / "milestone2_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
     try:
-        RAW_HR = str(BASE / "kaggle_data" / "heartrate_seconds.csv")
-        raw_hr = pd.read_csv(RAW_HR).head(10)
-        st.subheader("❤️ Raw Heart Rate (first 10 rows)")
-        st.dataframe(raw_hr)
+        with open(txt_path, "rb") as f:
+            st.download_button("⬇️ Download Summary (TXT)", f, file_name="milestone2_summary.txt")
     except Exception:
-        st.info("Raw heart rate file not found (preview skipped).")
+        st.write("Summary TXT not available for download.")
 
-    # -------------------- 2️⃣ Preprocessing --------------------
+    st.markdown("### 🔗 Output files on server")
+    for name in ["features_m2.csv", "features_with_clusters.csv", "anomalies_m2.csv"]:
+        p = proc_dir / name
+        st.write(f"- `{name}` — {'exists' if p.exists() else 'missing'}: `{p}`")
+
+    st.success(f"Summary written to: {txt_path}")
+
+# ----------------- Preprocessing (Milestone 1) -----------------
+with main:
+    st.header("1️⃣ Data Creation — Raw Dataset")
+    st.info("This app will create demo data if no raw CSVs are found.")
     if run_btn:
-        # set start time here (ensure variable exists when used later)
         start_time = time.time()
         st.header("2️⃣ Preprocessing pipeline — running...")
         p = st.progress(0)
 
-        # ---- Load raw files (example) ----
-        RAW_HR = str(BASE / "kaggle_data" / "heartrate_seconds.csv")
-        RAW_ST = str(BASE / "kaggle_data" / "minuteStepsNarrow.csv")
-        RAW_SL = str(BASE / "kaggle_data" / "sleepDay_merged.csv")
-
-        # Read safely (preview)
-        try:
-            raw_hr = pd.read_csv(RAW_HR).head(10)
-            st.subheader("💓 Raw Heart Rate (first 10 rows)")
-            st.dataframe(raw_hr)
-        except Exception:
-            st.warning("Heart rate file not found.")
-
-        try:
-            raw_steps = pd.read_csv(RAW_ST).head(10)
-            st.subheader("👣 Raw Steps (first 10 rows)")
-            st.dataframe(raw_steps)
-        except Exception:
-            st.warning("Steps file not found.")
-
-        try:
-            raw_sleep = pd.read_csv(RAW_SL).head(10)
-            st.subheader("😴 Raw Sleep (first 10 rows)")
-            st.dataframe(raw_sleep)
-        except Exception:
-            st.warning("Sleep file not found.")
-
-        # Continue pipeline
-        start_time = time.time()
-        p.progress(0)
-
-        # 1) Generate or load sample
         st.info("📌 Generating sample dataset...")
         df = generate_sample(int(n_rows))
         st.write("Raw sample (first rows):")
         st.dataframe(df.head(10))
         p.progress(10)
 
-        # 2) optional missing injection
         if inject_missing and missing_frac > 0:
             st.warning("⚠️ Injecting missing values for demo...")
             num = int(len(df) * missing_frac)
@@ -160,12 +231,10 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
                     df.loc[idx, c] = np.nan
         p.progress(20)
 
-        # 3) Timestamp normalize
-        st.info("⏳ Normalizing timestamps to naive UTC-like format...")
+        st.info("⏳ Normalizing timestamps...")
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
         p.progress(30)
 
-        # 4) Remove duplicates
         st.info("🧽 Removing duplicates...")
         before = len(df)
         df = df.drop_duplicates(subset=['timestamp'])
@@ -173,7 +242,6 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
         st.write(f"Rows before: {before}, after de-dup: {after}")
         p.progress(40)
 
-        # 5) Outlier detect & correct
         st.info("📉 Detecting & correcting outliers...")
         outlier_report = {"iqr_count":0, "z_count":0}
         if 'heart_rate' in df.columns:
@@ -187,7 +255,6 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
             z_count = int(z_mask.sum())
             outlier_report['iqr_count'] = iqr_count
             outlier_report['z_count'] = z_count
-
             if outlier_method == "clip_iqr":
                 df['heart_rate'] = df['heart_rate'].clip(lower=low, upper=high)
             else:
@@ -195,17 +262,12 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
                 df.loc[z_mask, 'heart_rate'] = median_hr
         p.progress(55)
 
-        # 6) Fill missing values
         st.info("🩺 Filling missing values...")
-        # -------------------- 3️⃣ Data Quality Assessment --------------------
         st.header("3️⃣ Data Quality Assessment")
-
         st.subheader("➡️ Missing Value Summary")
         st.write(df.isna().sum())
-
         st.subheader("➡️ Outlier Summary")
         st.write(outlier_report)
-
         st.subheader("➡️ Basic Statistics")
         st.write(df.describe())
         if 'heart_rate' in df.columns:
@@ -216,7 +278,6 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
             df['calories'] = df['calories'].fillna(0.0)
         p.progress(70)
 
-        # 7) Resample to user frequency
         st.info(f"🕒 Resampling to {resample_freq}...")
         df_resampled = df.set_index('timestamp').resample(resample_freq).agg({
             'heart_rate':'mean',
@@ -229,7 +290,6 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
             df_resampled['sleep_flag'] = (df_resampled['sleep_flag'] >= 0.5).astype(int)
         p.progress(85)
 
-        # 8) Final checks & save cleaned CSV
         st.info("✅ Standardizing and saving cleaned CSV...")
         df_resampled['timestamp'] = pd.to_datetime(df_resampled['timestamp'])
         for col in df_resampled.select_dtypes(include=[np.number]).columns:
@@ -241,18 +301,13 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
         st.write("Cleaned preview:")
         st.dataframe(df_resampled.head(20))
 
-        # ---------------- Visualizations ----------------
-        # Heart rate: plotly line + smoothed + IQR
+        # Visuals (heart rate, steps, sleep) kept as before
         hr_df = df_resampled[['timestamp','heart_rate']].dropna().copy()
         if not hr_df.empty:
-
             hr_df['rolling'] = hr_df['heart_rate'].rolling(window=max(1, int(len(hr_df)/8))).mean()
             window = max(1, int(len(hr_df)/8))
-
             q_high = hr_df['heart_rate'].rolling(window=window).quantile(0.75).fillna(method='bfill')
             q_low  = hr_df['heart_rate'].rolling(window=window).quantile(0.25).fillna(method='ffill')
-
-            # 🔍 Add anomaly detection (simple threshold-based using rolling + std)
             hr_df['anomaly'] = False
             if len(hr_df) > 5:
                 hr_std = hr_df['heart_rate'].std(ddof=0)
@@ -260,65 +315,32 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
                     (hr_df['heart_rate'] > hr_df['rolling'] + 2 * hr_std) |
                     (hr_df['heart_rate'] < hr_df['rolling'] - 2 * hr_std)
                 )
-
-            # Plotting
             fig_hr = go.Figure()
-
-            fig_hr.add_trace(go.Scatter(
-                x=hr_df['timestamp'], y=hr_df['heart_rate'],
-                mode='lines', name='BPM',
-                line=dict(color='firebrick', width=1), opacity=0.7
-            ))
-
-            fig_hr.add_trace(go.Scatter(
-                x=hr_df['timestamp'], y=hr_df['rolling'],
-                mode='lines', name='Smoothed',
-                line=dict(color='darkred', width=2)
-            ))
-
-            fig_hr.add_trace(go.Scatter(
-                x=list(hr_df['timestamp']) + list(hr_df['timestamp'][::-1]),
-                y=list(q_high) + list(q_low[::-1]),
-                fill='toself', fillcolor='rgba(200,30,30,0.12)',
-                line=dict(color='rgba(255,255,255,0)'),
-                hoverinfo="skip", showlegend=True, name='IQR'
-            ))
-
-            # ⭐ Add anomaly markers (only if any)
+            fig_hr.add_trace(go.Scatter(x=hr_df['timestamp'], y=hr_df['heart_rate'], mode='lines', name='BPM', line=dict(width=1), opacity=0.7))
+            fig_hr.add_trace(go.Scatter(x=hr_df['timestamp'], y=hr_df['rolling'], mode='lines', name='Smoothed', line=dict(width=2)))
+            fig_hr.add_trace(go.Scatter(x=list(hr_df['timestamp']) + list(hr_df['timestamp'][::-1]),
+                                        y=list(q_high) + list(q_low[::-1]),
+                                        fill='toself', fillcolor='rgba(200,30,30,0.12)', line=dict(color='rgba(255,255,255,0)'),
+                                        hoverinfo="skip", showlegend=True, name='IQR'))
             anom = hr_df[hr_df['anomaly'] == True]
             if not anom.empty:
-                fig_hr.add_trace(go.Scatter(
-                    x=anom['timestamp'], y=anom['heart_rate'],
-                    mode='markers', name='Anomaly',
-                    marker=dict(color='yellow', size=9, symbol='x')
-                ))
-
-            fig_hr.update_layout(
-                title="❤️ Heart Rate (resampled + smooth + anomalies)",
-                template='plotly_dark',
-                height=420
-            )
-
+                fig_hr.add_trace(go.Scatter(x=anom['timestamp'], y=anom['heart_rate'], mode='markers', name='Anomaly',
+                                            marker=dict(color='yellow', size=9, symbol='x')))
+            fig_hr.update_layout(title="❤️ Heart Rate (resampled + smooth + anomalies)", template='plotly_dark', height=420)
             st.plotly_chart(fig_hr, use_container_width=True)
 
-            # ECG-style preview synthesized
             st.markdown("**ECG-style preview** (synthesized from BPM for demo)")
-            ecg_preview = synth_ecg_from_bpm(
-                df_resampled[['timestamp','heart_rate']].rename(columns={'heart_rate':'heart_rate'}),
-                max_seconds=60
-            )
+            ecg_preview = synth_ecg_from_bpm(df_resampled[['timestamp','heart_rate']].rename(columns={'heart_rate':'heart_rate'}), max_seconds=60)
             if not ecg_preview.empty:
                 fig_ecg = px.line(ecg_preview, x='timestamp', y='ecg', template='plotly_dark', labels={'ecg':''})
                 fig_ecg.update_layout(height=240)
                 st.plotly_chart(fig_ecg, use_container_width=True)
 
-        # Steps chart
         st.markdown("### 🦶 Steps (resampled)")
         fig_steps = px.bar(df_resampled, x='timestamp', y='steps', template='plotly_dark', labels={'timestamp':'Time','steps':'Steps'})
         fig_steps.update_layout(height=300)
         st.plotly_chart(fig_steps, use_container_width=True)
 
-        # Sleep timeline
         if 'sleep_flag' in df_resampled.columns:
             st.markdown("### 😴 Sleep timeline (1 = asleep)")
             sleep_df = df_resampled[['timestamp','sleep_flag']].copy()
@@ -331,35 +353,26 @@ Use the controls on the left (sample rows, missing values, outlier method, etc.)
 # 🧾 Show full cleaned dataset inside dashboard (safe, no errors)
 # -----------------------------
 st.markdown("## 🧾 Full Cleaned Dataset (No Missing Values)")
-
-# If the pipeline created df_resampled, show it; otherwise ask user to run pipeline.
 if 'df_resampled' in locals():
     st.dataframe(df_resampled, use_container_width=True, height=500)
 else:
     st.info("Cleaned dataset not generated yet. Click 'Run Preprocessing' to generate it.")
 
 # -----------------------------
-# 🔎 Summary Insights (girl-style metric cards)
+# 🔎 Summary Insights
 # -----------------------------
 st.markdown("## 🔎 Summary Insights")
 if 'df_resampled' in locals():
     try:
-        # Determine minutes per row from resample_freq (e.g. "1min" -> 1, "5min" -> 5)
         try:
             minutes_per_row = int(''.join(filter(str.isdigit, str(resample_freq)))) or 1
         except Exception:
             minutes_per_row = 1
-
-        # Safe metric calculations
         min_hr = int(round(df_resampled['heart_rate'].min())) if not df_resampled['heart_rate'].dropna().empty else 0
         max_hr = int(round(df_resampled['heart_rate'].max())) if not df_resampled['heart_rate'].dropna().empty else 0
         avg_steps = round(float(df_resampled['steps'].mean()) if not df_resampled['steps'].dropna().empty else 0.0, 2)
-
-        # Avg sleep in hours: sum of sleep_flag * minutes_per_row -> hours
         total_sleep_minutes = int(df_resampled['sleep_flag'].sum()) * minutes_per_row if 'sleep_flag' in df_resampled.columns else 0
         avg_sleep_hours = round(total_sleep_minutes / 60.0, 2)
-
-        # show as 4 large metrics in one row
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.metric(label="Min HR", value=f"{min_hr}")
@@ -369,8 +382,6 @@ if 'df_resampled' in locals():
             st.metric(label="Avg Steps", value=f"{avg_steps}")
         with c4:
             st.metric(label="Avg Sleep (hrs)", value=f"{avg_sleep_hours}")
-
-        # Optional: show counts and file path below (small)
         st.write(f"**Total rows (resampled):** {len(df_resampled)}")
         st.write(f"**Cleaned CSV saved at:** `{OUT_CLEAN}`")
     except Exception:
@@ -378,54 +389,42 @@ if 'df_resampled' in locals():
 else:
     st.info("Run preprocessing to see summary insights here.")
 
-# -----------------------------
-# ⏱ Show elapsed time if available (safe check)
-# -----------------------------
 if 'start_time' in locals():
     elapsed = time.time() - start_time
     st.success(f"✨ Preprocessing complete in {elapsed:.2f}s — fully cleaned dataset displayed above.")
 else:
-    # do not error if the pipeline wasn't executed in this session
-    st.write("")  # no-op placeholder
-# -----------------------------
-# End of file
-# -----------------------------
+    st.write("")
+
 # ============================================================
 #                   M I L E S T O N E   2
 #     Feature Engineering + Forecasting + Clustering + Summary
 # ============================================================
-
-import json
-from datetime import datetime
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import DBSCAN, KMeans
-
 st.markdown("---")
 st.header("📘 Milestone 2 — Feature Extraction, Clustering & Summary")
 
 # ----------------------------
-# Milestone-2 UI controls
+# Milestone-2 UI controls (now includes metric selection)
 # ----------------------------
 colA, colB, colC = st.columns(3)
 
 with colA:
-    m2_window = st.number_input("Window size (rows)", 30, 2000, 60, 10)
+    m2_window = st.number_input("Window size (rows)", 10, 2000, 60, 10)
     overlap_pct = st.slider("Window overlap %", 0, 90, 50)
+    metric = st.selectbox("Metric to extract", ["heart_rate", "steps", "calories"], index=0)
 
 with colB:
     use_tsfresh = st.checkbox("Use TSFresh (Recommended)", True)
-    run_prophet = st.checkbox("Run Prophet Forecasting", False)
+    run_prophet = st.checkbox("Run Prophet Forecasting (optional)", False)
 
 with colC:
     k_kmeans = st.number_input("KMeans clusters", 1, 10, 3)
     dbscan_eps = st.number_input("DBSCAN ε", 0.1, 5.0, 0.5)
     dbscan_min = st.number_input("DBSCAN min_samples", 1, 50, 5)
 
-run_m2 = st.button("🚀 Run Milestone 2 Pipeline")
+run_m2 = st.button("▶️ Run Milestone 2 (both)")
 
 # ============================================================
-#                TSFresh Feature Extractor Class
+#                TSFresh Feature Extractor Class (compact)
 # ============================================================
 class TSFreshFeatureExtractor:
     def __init__(self, feature_complexity="minimal"):
@@ -435,9 +434,7 @@ class TSFreshFeatureExtractor:
         self.extraction_report = {}
 
     def extract_features(self, df, data_type, window_size):
-        from datetime import datetime
         start_time = datetime.now()
-
         report = {
             "data_type": data_type,
             "original_rows": len(df),
@@ -457,9 +454,7 @@ class TSFreshFeatureExtractor:
         try:
             from tsfresh import extract_features
             from tsfresh.utilities.dataframe_functions import impute
-
             fc_params = {"mean": None, "median": None, "standard_deviation": None}
-
             features = extract_features(
                 df_prep,
                 column_id="window_id",
@@ -470,43 +465,35 @@ class TSFreshFeatureExtractor:
             )
             features = impute(features)
         except Exception as e:
-            report["error"] = str(e)
+            report["error"] = f"TSFresh error/import failed: {e}"
             report["summary"] = self._build_report(report)
             return pd.DataFrame(), report
 
         features = features.loc[:, features.nunique() > 1]
-
         self.feature_matrix = features
         report["feature_windows"] = len(features)
         report["features_extracted"] = features.shape[1]
         report["success"] = True
         report["summary"] = self._build_report(report)
-
         return features, report
 
     def _prepare_data(self, df, data_type, window_size):
         if data_type not in df.columns:
             return None
-
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
-
         rows = []
         window_id = 0
-        step = window_size // 2
-
+        step = max(1, window_size // 2)
         for i in range(0, len(df) - window_size + 1, step):
             block = df.iloc[i:i+window_size][["timestamp", data_type]].copy()
-            block["value"] = block[data_type]
+            block = block.rename(columns={data_type: "value"})
             block["window_id"] = window_id
-            block = block[["timestamp", "value", "window_id"]]
-            rows.append(block)
+            rows.append(block[["timestamp", "value", "window_id"]])
             window_id += 1
-
         if not rows:
             return None
-
         return pd.concat(rows, ignore_index=True)
 
     def _build_report(self, rep):
@@ -517,112 +504,163 @@ class TSFreshFeatureExtractor:
             f"Windows Created: {rep['feature_windows']}",
             f"Features Extracted: {rep['features_extracted']}",
         ]
-        if rep["error"]:
+        if rep.get("error"):
             msg.append(f"ERROR: {rep['error']}")
         return "\n".join(msg)
-
-
-# ============================================================
-#               Milestone-2 Summary UI writer
-# ============================================================
-def milestone2_summary_ui(report, features_df, prophet_count, clustering_methods, anomalies_count):
-    st.markdown("## 📝 Final Summary — Milestone 2")
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Rows Processed", report["original_rows"])
-    col2.metric("Features Extracted", report["features_extracted"])
-    col3.metric("Anomalies Detected", anomalies_count)
-
-    st.code(report["summary"], language="text")
-
-    summary_path = PROC / "milestone2_summary.txt"
-    with open(summary_path, "w") as f:
-        f.write(report["summary"])
-
-    st.success(f"Summary saved: {summary_path}")
-
-    with open(summary_path, "rb") as f:
-        st.download_button("⬇ Download Summary File", f, file_name="milestone2_summary.txt")
-
 
 # ============================================================
 #                    RUN MILESTONE-2
 # ============================================================
 if run_m2:
-
     if not OUT_CLEAN.exists():
         st.error("Run Milestone-1 first (cleaned_fitness_data.csv missing).")
         st.stop()
 
     df_clean = pd.read_csv(OUT_CLEAN)
-    df_clean["timestamp"] = pd.to_datetime(df_clean["timestamp"])
+    if 'timestamp' in df_clean.columns:
+        df_clean['timestamp'] = pd.to_datetime(df_clean['timestamp'])
 
-    st.info("Extracting features...")
+    st.info(f"Loaded cleaned data: {len(df_clean)} rows — extracting metric: {metric}")
+
     extractor = TSFreshFeatureExtractor()
-    features, report = extractor.extract_features(df_clean, "heart_rate", m2_window)
+    features = pd.DataFrame()
+    report = {}
 
-    if not report["success"]:
-        st.error("Feature extraction failed.")
-        st.text(report["summary"])
-        milestone2_summary_ui(report, features, 0, [], 0)
+    # 1) Try TSFresh if user asked for it
+    if use_tsfresh:
+        features, report = extractor.extract_features(df_clean, metric, int(m2_window))
+
+    # 2) If TSFresh failed or user disabled it, fallback to simple extractor
+    if (not report) or (not report.get("success", False)) or features is None or features.empty:
+        if use_tsfresh:
+            st.warning("TSFresh not available or produced no features — attempting simple rolling-window extractor.")
+        else:
+            st.info("Using simple rolling-window extractor (TSFresh disabled).")
+
+        features = simple_window_features(df_clean, metric, int(m2_window))
+        report = {
+            "data_type": metric,
+            "original_rows": len(df_clean),
+            "window_size": int(m2_window),
+            "feature_windows": len(features),
+            "features_extracted": 0 if features.empty else features.shape[1],
+            "success": False if features.empty else True,
+            "error": None,
+            "summary": f"Fallback/simple extractor produced {len(features)} windows and {features.shape[1] if not features.empty else 0} features."
+        }
+
+    if features is None or features.empty:
+        st.error("No features produced. Try smaller window size, increase overlap, or provide more/longer data.")
+        milestone2_summary_ui(report, features, prophet_count=0, clustering_methods=[], anomalies_count=0, proc_dir=PROC)
         st.stop()
 
-    # Save feature matrix
-    features.to_csv(PROC / "features_m2.csv", index=False)
-
-    # -------------------- CLUSTERING --------------------
+    # Ensure numeric features only for clustering
     numeric = features.select_dtypes(include=[np.number]).fillna(0)
+    feats_path = PROC / "features_m2.csv"
+    features.to_csv(feats_path, index=False)
+    st.info(f"Saved features → {feats_path}")
 
-    scaler = StandardScaler()
-    X = scaler.fit_transform(numeric)
+    # 3) Optional Prophet forecasting (attempt if requested and enough windows)
+    prophet_count = 0
+    if run_prophet:
+        try:
+            from prophet import Prophet
+            numeric_windows = numeric
+            if numeric_windows.shape[0] >= 5:
+                y = numeric_windows.mean(axis=1).reset_index(drop=True)
+                ds = pd.date_range(start=df_clean['timestamp'].min(), periods=len(y), freq='T')[:len(y)]
+                df_for_prophet = pd.DataFrame({"ds": ds, "y": y})
+                model = Prophet()
+                model.fit(df_for_prophet)
+                future = model.make_future_dataframe(periods=min(60, int(len(y)*0.2)), freq='T')
+                forecast = model.predict(future)
+                prophet_count = 1
+                st.markdown("#### Prophet forecast (preview)")
+                st.dataframe(forecast[['ds','yhat']].head(8))
+                fig_fore = px.line(forecast, x='ds', y='yhat', title='Prophet forecast (yhat)', template='plotly_dark')
+                st.plotly_chart(fig_fore, use_container_width=True)
+            else:
+                st.info("Not enough windows to run Prophet forecasting.")
+        except Exception as e:
+            st.warning("Prophet not available or failed: " + str(e))
+            prophet_count = 0
 
-    clustering_methods = []
+    # 4) Clustering — use defensive KMeans and DBSCAN
+    clustering_methods_done = []
+    if numeric.shape[0] > 0 and numeric.shape[1] >= 1:
+        scaler = StandardScaler()
+        X = scaler.fit_transform(numeric)
 
-    # KMeans
+        # Safe KMeans
+        try:
+            n_samples = X.shape[0]
+            requested_k = int(k_kmeans)
+            if n_samples <= 0:
+                st.info("KMeans skipped: no numeric windows available.")
+            else:
+                actual_k = min(requested_k, max(1, n_samples))
+                if actual_k != requested_k:
+                    st.warning(f"KMeans clusters reduced from {requested_k} → {actual_k} because only {n_samples} windows are available.")
+                km = KMeans(n_clusters=actual_k, random_state=42, n_init="auto")
+                features['kmeans'] = km.fit_predict(X)
+                clustering_methods_done.append('kmeans')
+                st.info(f"KMeans completed (k={actual_k})")
+        except Exception as e:
+            st.warning("KMeans failed: " + str(e))
+
+        # DBSCAN
+        try:
+            db = DBSCAN(eps=float(dbscan_eps), min_samples=int(dbscan_min))
+            features['dbscan'] = db.fit_predict(X)
+            clustering_methods_done.append('dbscan')
+            st.info("DBSCAN completed")
+        except Exception as e:
+            st.warning("DBSCAN failed: " + str(e))
+    else:
+        st.warning("Not enough numeric features for clustering.")
+
+    clustered_path = PROC / "features_with_clusters.csv"
+    features.to_csv(clustered_path, index=False)
+    st.info(f"Saved clustered features → {clustered_path}")
+
+    # 5) Anomaly detection (3-sigma on per-row mean)
+    anomalies_count = 0
     try:
-        km = KMeans(n_clusters=int(k_kmeans), random_state=42)
-        features["kmeans"] = km.fit_predict(X)
-        clustering_methods.append("kmeans")
-    except:
+        if numeric.shape[0] > 0:
+            window_mean = numeric.mean(axis=1)
+            mu = float(window_mean.mean()) if len(window_mean)>0 else 0.0
+            sigma = float(window_mean.std()) if float(window_mean.std())>0 else 1.0
+            anomalies_mask = (np.abs(window_mean - mu) > 3 * sigma)
+            features['anomaly'] = anomalies_mask
+            anomalies_count = int(anomalies_mask.sum())
+            anomalies_path = PROC / "anomalies_m2.csv"
+            features[features['anomaly']].to_csv(anomalies_path, index=False)
+            st.warning(f"Anomalous windows detected: {anomalies_count} (saved → {anomalies_path})")
+        else:
+            st.info("Skipping anomaly detection — no numeric feature rows.")
+    except Exception as e:
+        st.warning("Anomaly detection error: " + str(e))
+
+    # 6) PCA visualization (if possible)
+    try:
+        if numeric.shape[1] >= 2 and numeric.shape[0] >= 2:
+            pca = PCA(n_components=2)
+            coords = pca.fit_transform(scaler.transform(numeric))
+            features['pc1'] = coords[:,0]
+            features['pc2'] = coords[:,1]
+            color_col = 'kmeans' if 'kmeans' in features.columns else ('dbscan' if 'dbscan' in features.columns else None)
+            fig_pca = px.scatter(features, x='pc1', y='pc2', color=features[color_col].astype(str) if color_col else None,
+                                 title="PCA of window features", template='plotly_dark')
+            st.plotly_chart(fig_pca, use_container_width=True)
+    except Exception:
         pass
 
-    # DBSCAN
-    try:
-        db = DBSCAN(eps=float(dbscan_eps), min_samples=int(dbscan_min))
-        features["dbscan"] = db.fit_predict(X)
-        clustering_methods.append("dbscan")
-    except:
-        pass
+    # 7) Final summary
+    milestone2_summary_ui(report=report,
+                         features_df=features,
+                         prophet_count=prophet_count,
+                         clustering_methods=clustering_methods_done,
+                         anomalies_count=anomalies_count,
+                         proc_dir=PROC)
 
-    features.to_csv(PROC / "features_with_clusters.csv", index=False)
-
-    # -------------------- ANOMALY DETECTION --------------------
-    mean_vals = numeric.mean(axis=1)
-    mu = mean_vals.mean()
-    sigma = mean_vals.std()
-
-    anomalies = (abs(mean_vals - mu) > 3 * sigma)
-    features["anomaly"] = anomalies
-
-    anomalies_df = features[features["anomaly"]]
-    anomalies_df.to_csv(PROC / "anomalies_m2.csv", index=False)
-
-    anomaly_count = anomalies.sum()
-
-    # -------------------- PCA VISUAL --------------------
-    if numeric.shape[1] >= 2:
-        pca = PCA(n_components=2)
-        coords = pca.fit_transform(X)
-        features["pc1"] = coords[:, 0]
-        features["pc2"] = coords[:, 1]
-
-        st.markdown("### 📌 PCA Scatter Plot")
-        fig = px.scatter(features, x="pc1", y="pc2",
-                         color=features["kmeans"].astype(str) if "kmeans" in features else None,
-                         template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
-
-    # -------------------- FINAL SUMMARY --------------------
-    milestone2_summary_ui(report, features, prophet_count=0,
-                          clustering_methods=clustering_methods,
-                          anomalies_count=anomaly_count)
+    st.success("Milestone 2 finished.")
