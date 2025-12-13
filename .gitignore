@@ -1,2 +1,13 @@
+venv/
+
+__pycache__/
+*.pyc
+*.pyo
+
+streamlit_run.log
+
+.DS_Store
+
 data_processed/
 data_raw/
+kaggle_data/
