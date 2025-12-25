@@ -524,3 +524,208 @@ if run_m2_all:
 # -----------------------------
 # End of Milestone 2 replacement
 # -----------------------------
+# =========================================================
+# MILESTONE 3 — ADVANCED ANOMALY DETECTION
+# =========================================================
+
+st.markdown("---")
+st.header("🚨 Milestone 3 — Advanced Anomaly Detection & Reporting")
+
+# -------- Load cleaned data --------
+df_m3 = pd.read_csv(OUT_CLEAN)
+df_m3["timestamp"] = pd.to_datetime(df_m3["timestamp"])
+df_m3 = df_m3.sort_values("timestamp").reset_index(drop=True)
+
+st.subheader("📄 Input Data Preview")
+st.dataframe(df_m3.head())
+
+# =====================================================
+# STEP 1 — RULE-BASED (THRESHOLD) DETECTION
+# =====================================================
+st.subheader("1️⃣ Rule-Based Anomaly Detection (Thresholds)")
+
+df_m3["rule_hr"] = ((df_m3["heart_rate"] > 120) | (df_m3["heart_rate"] < 45)).astype(int)
+df_m3["rule_steps"] = (df_m3["steps"] > df_m3["steps"].quantile(0.99)).astype(int)
+df_m3["rule_calories"] = (df_m3["calories"] > df_m3["calories"].quantile(0.99)).astype(int)
+
+st.write("Rule-based anomaly counts:")
+st.write(df_m3[["rule_hr","rule_steps","rule_calories"]].sum())
+
+# =====================================================
+# STEP 2 — MODEL-BASED (PROPHET)
+# =====================================================
+st.subheader("2️⃣ Model-Based Detection (Prophet Residuals)")
+
+if PROPHET_OK:
+    prophet_df = df_m3[["timestamp","heart_rate"]].rename(
+        columns={"timestamp":"ds","heart_rate":"y"}
+    )
+    model = Prophet(daily_seasonality=True)
+    model.fit(prophet_df)
+    forecast = model.predict(prophet_df)
+
+    df_m3["residual"] = prophet_df["y"] - forecast["yhat"]
+    df_m3["model_anomaly"] = (
+        abs(df_m3["residual"]) > 2 * df_m3["residual"].std()
+    ).astype(int)
+
+    fig_prophet = px.line(forecast, x="ds", y="yhat", title="Prophet Forecast")
+    fig_prophet.add_scatter(
+        x=prophet_df["ds"], y=prophet_df["y"],
+        mode="lines", name="Actual"
+    )
+    st.plotly_chart(fig_prophet, use_container_width=True)
+else:
+    df_m3["model_anomaly"] = 0
+    df_m3["residual"] = 0
+
+# =====================================================
+# STEP 3 — CLUSTER-BASED (DBSCAN)
+# =====================================================
+st.subheader("3️⃣ Cluster-Based Detection (DBSCAN)")
+
+features = df_m3[["heart_rate","steps","calories"]].fillna(0)
+scaled = StandardScaler().fit_transform(features)
+
+db = DBSCAN(eps=1.5, min_samples=5)
+df_m3["cluster_label"] = db.fit_predict(scaled)
+df_m3["cluster_anomaly"] = (df_m3["cluster_label"] == -1)
+
+fig_cluster = go.Figure()
+
+normal = df_m3[df_m3["cluster_label"] != -1]
+anomaly = df_m3[df_m3["cluster_label"] == -1]
+
+fig_cluster.add_trace(go.Scatter(
+    x=normal["heart_rate"], y=normal["calories"],
+    mode="markers", marker=dict(color="lightblue", size=7),
+    name="Normal"
+))
+fig_cluster.add_trace(go.Scatter(
+    x=anomaly["heart_rate"], y=anomaly["calories"],
+    mode="markers", marker=dict(color="red", size=9, symbol="x"),
+    name="DBSCAN Anomaly"
+))
+
+fig_cluster.update_layout(
+    title="DBSCAN Clustering (Red = Anomaly)",
+    template="plotly_dark"
+)
+st.plotly_chart(fig_cluster, use_container_width=True)
+
+# =====================================================
+# STEP 4 — COMBINE ALL METHODS
+# =====================================================
+st.subheader("4️⃣ Combining All Detection Methods")
+
+df_m3["anomaly_count"] = (
+    df_m3["rule_hr"] +
+    df_m3["rule_steps"] +
+    df_m3["rule_calories"] +
+    df_m3["model_anomaly"] +
+    df_m3["cluster_anomaly"]
+)
+
+def confidence_level(c):
+    if c >= 2: return "HIGH"
+    if c == 1: return "MEDIUM"
+    return "NORMAL"
+
+df_m3["confidence"] = df_m3["anomaly_count"].apply(confidence_level)
+st.write(df_m3["confidence"].value_counts())
+
+# =====================================================
+# FINAL BAR GRAPH — ANOMALIES BY METHOD (PLACED CORRECTLY)
+# =====================================================
+st.markdown("## 📊 Anomalies Detected by Method")
+
+method_counts = pd.DataFrame({
+    "Method": [
+        "Threshold-Based (Rules)",
+        "Model-Based (Prophet)",
+        "Cluster-Based (DBSCAN)"
+    ],
+    "Anomaly Count": [
+        int(df_m3["rule_hr"].sum() + df_m3["rule_steps"].sum() + df_m3["rule_calories"].sum()),
+        int(df_m3["model_anomaly"].sum()),
+        int(df_m3["cluster_anomaly"].sum())
+    ]
+})
+
+fig_methods = px.bar(
+    method_counts,
+    x="Method",
+    y="Anomaly Count",
+    text="Anomaly Count",
+    color="Method",
+    title="Anomalies Detected by Each Method"
+)
+
+fig_methods.update_traces(textposition="outside")
+st.plotly_chart(fig_methods, use_container_width=True)
+
+# =====================================================
+# STEP 5 — SEVERITY SCORE
+# =====================================================
+st.markdown("## 🔥 Average Severity Score")
+
+df_m3["severity_score"] = df_m3["anomaly_count"] * 2 + df_m3["residual"].abs()
+
+avg_severity = (
+    df_m3.groupby("confidence")["severity_score"]
+    .mean()
+    .reset_index()
+)
+
+fig_severity = px.bar(
+    avg_severity,
+    x="confidence",
+    y="severity_score",
+    color="confidence",
+    color_discrete_map={
+        "NORMAL": "green",
+        "MEDIUM": "orange",
+        "HIGH": "red"
+    },
+    title="Average Severity Score by Confidence"
+)
+
+st.plotly_chart(fig_severity, use_container_width=True)
+# =====================================================
+# STEP 6 — VISUALIZATIONS
+# =====================================================
+st.markdown("## 📈 Metric-wise Visualization")
+
+metric_choice = st.selectbox(
+    "Select Metric",
+    ["heart_rate","steps","calories","sleep_flag"]
+)
+
+fig_metric = px.line(df_m3, x="timestamp", y=metric_choice)
+high_df = df_m3[df_m3["confidence"]=="HIGH"]
+
+fig_metric.add_scatter(
+    x=high_df["timestamp"],
+    y=high_df[metric_choice],
+    mode="markers",
+    marker=dict(color="red", size=8),
+    name="High Anomaly"
+)
+st.plotly_chart(fig_metric, use_container_width=True)
+
+# =====================================================
+# STEP 7 — SUMMARY REPORT (LAST)
+# =====================================================
+st.subheader("📊 Summary Report")
+
+c1,c2,c3 = st.columns(3)
+c1.metric("Total Records", len(df_m3))
+c2.metric("Total Anomalies", (df_m3["confidence"]!="NORMAL").sum())
+c3.metric("High Confidence", (df_m3["confidence"]=="HIGH").sum())
+
+st.subheader("Top Severe Anomalies")
+st.dataframe(
+    df_m3.sort_values("severity_score", ascending=False)
+    .head(10)
+)
+st.success("✅ Milestone 3 completed successfully")
